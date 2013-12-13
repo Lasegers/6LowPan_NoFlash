@@ -93,19 +93,5 @@ typedef enum {
 
 } keymanagement_flags_type_t;
 
-typedef enum {
-	/**< The session key is still valid and fresh */
-	FRESH 			= 0x03,
-	/**< The session key has expired */
-	EXPIRED 		= 0x01,
-	/**< The nonce has to be updated in flash */
-	UPDATE_NONCE	= 0x02,
-	/**< Free spot in device list */
-	FREE_SPOT		= 0x00,
-	/**< Reserved spot in device list */
-	RESERVED		= 0x04,
-	/**< Key exchange failed before */
-	FAILED			= 0x05,
-} keyfreshness_flags_type_t;
 
 #endif /* KEYMANAGEMENT_V1_H_ */

@@ -6,6 +6,7 @@
  */
 #include "net/sec-arp-client.h"
 #include "net/rime/rimeaddr.h"
+#include "net/sec_data.h"
 #include "net/uip-ds6.h"
 #include "net/uip.h"
 #include "dev/slip.h"
@@ -29,7 +30,7 @@
 #define SEC_DATA_SIZE 		33
 #define KEY_SIZE			16
 
-struct device_sec_data devices[MAX_DEVICES];
+struct device_sec_data __attribute__((__d20__)) devices[MAX_DEVICES];
 uint8_t  hasKeyIs_1;
 
 static short parse_hello_reply(uint8_t *buf);

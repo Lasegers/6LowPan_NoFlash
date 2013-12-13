@@ -6,35 +6,43 @@
  */
 
 #include "symm-key-client-v1.h"
+#include "net/sec_data.h"
+#include "net/sec_data.c"
 #include "dev/cc2420.h"
 #include "net/packetbuf.h"
 #include "sys/clock.h"
 
 #include <string.h>
 
-#if ENABLE_CCM_APPLICATION & SEC_CLIENT | 1
+#define MEASURE_ENERGY 0
 
-#define DEBUG_SEC 0
+#if MEASURE_ENERGY
+#include "sys/energest.h"
+#include "sys/rtimer.h"
+#endif
+
+#if ENABLE_CCM_APPLICATION & SEC_CLIENT
+
+#define DEBUG_SEC 1
 #if DEBUG_SEC
 #include <stdio.h>
-#define PRINTF(...) printf(__VA_ARGS__)
+#define PRINTFSECKEY(...)
 #define PRINTFDEBUG(...) printf(__VA_ARGS__)
+#define PRINTF(...) printf(__VA_ARGS__)
 #else
+#define PRINTFSECKEY(...)
 #define PRINTFDEBUG(...)
-#define PRINTF(...)
 #endif
 
 #define UIP_IP_BUF   ((struct uip_ip_hdr *)&uip_buf[UIP_LLH_LEN])
 #define UDP_CLIENT_SEC_PORT 5446
 #define UDP_SERVER_SEC_PORT 5444
 
-//#define MAX_DEVICES 			3
 #define DEVICE_NOT_FOUND 		-1
 #define AUTHENTICATION_SUCCES	0x00
 
 /* Variable sizes */
 #define SEC_DATA_SIZE 			32
-#define DEVICE_ID_SIZE			16
 #define SEC_KEY_SIZE			16
 #define KEY_NONCE_SIZE			4
 #define NONCE_CNTR_SIZE			1
@@ -43,8 +51,6 @@
 
 /* Register offsets */
 #define SEC_KEY_OFFSET			16
-#define EDGE_ROUTER_INDEX		0
-#define RESERVED_INDEX			1
 
 /* Timing defines */
 #define CHECK_INTERVAL		(CLOCK_SECOND)*5
@@ -75,8 +81,9 @@
 #define VERIFY_REQUEST_MSG_SIZE	28	/* encryption_nonce(3) | msg_type(1) | encrypted_verify_nonce(3) | padding (12) | MIC(8) */
 #define VERIFY_REPLY_MSG_SIZE	28	/* encryption_nonce(3) | msg_type(1) | encrypted_remote_verify_nonce(3) | padding (12) | MIC(8) */
 
+
 /* Global variables */
-struct device_sec_data devices[MAX_DEVICES];
+//struct device_sec_data __attribute__((__d20__)) devices[MAX_DEVICES]; //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 static short state;
 static short key_exchange_state;
 static uint8_t send_tries;
@@ -102,12 +109,8 @@ static int  search_device_id(uip_ipaddr_t* curr_device_id, uint8_t search_offset
 static int  add_device_id(uip_ipaddr_t* curr_device_id);
 static void set_session_key_of_index(int index);
 static uint8_t find_index_for_request(keyfreshness_flags_type_t search_option);
-static void update_nonce(uint8_t index);
 static void remove_sec_device(uint8_t index);
-static void reset_sec_data(uint8_t index);
-static void copy_id_to_reserved(uint8_t index);
 static void store_reserved_sec_data(void);
-static void reset_failed_key_exchanges(void);
 static int  remove_least_active_device(void);
 static uint8_t key_exchange_protocol(void);
 static void send_key_exchange_packet(void);
@@ -122,20 +125,6 @@ static uint8_t parse_comm_reply_message(uint8_t *data);
 PROCESS(keymanagement_process, "key management");
 /*---------------------------------------------------------------------------*/
 
-/*---------------------------------------------------------------------------*/
-static uint16_t
-get16(uint8_t *buffer, int pos)
-{
-  return (uint16_t)buffer[pos] << 8 | buffer[pos + 1];
-}
-/*---------------------------------------------------------------------------*/
-static void
-set16(uint8_t *buffer, int pos, uint16_t value)
-{
-  buffer[pos++] = value >> 8;
-  buffer[pos++] = value & 0xff;
-}
-/*---------------------------------------------------------------------------*/
 static void
 increment_request_nonce(void) {
 	if(request_nonce == 0xffff) {
@@ -272,6 +261,10 @@ keymanagement_send_encrypted_packet(struct uip_udp_conn *c, uint8_t *data, uint8
 	/* Get own ip address */
 	uip_ds6_select_src(&curr_ip, toaddr);
 
+	PRINTFSECKEY("ipv6: ");
+	for(i=1; i<16; i++) PRINTFSECKEY("%.2x ",curr_ip.u8[i]);
+	PRINTFSECKEY("\n");
+
 	/* Extend data packet with nonce */
 	for(i=0; i < MSG_NONCE_SIZE; i++) tempbuf[i] = (devices[dest_index].msg_cntr >> (((MSG_NONCE_SIZE-1)-i)*8)) & 0xff;
 	tempbuf[MSG_NONCE_SIZE] = devices[dest_index].nonce_cntr;
@@ -284,10 +277,11 @@ keymanagement_send_encrypted_packet(struct uip_udp_conn *c, uint8_t *data, uint8
 
 	total_len = *data_len + NONCE_SIZE;
 
-	PRINTFDEBUG("msg and nonce B: %d, %d\n", devices[dest_index].msg_cntr, devices[dest_index].nonce_cntr);
+	PRINTFSECKEY("msg and nonce B: %d, %d\n", devices[dest_index].msg_cntr, devices[dest_index].nonce_cntr);
 
 	/* Encrypt message */
 	if(!cc2420_encrypt_ccm(tempbuf, &curr_ip.u8[0], &devices[dest_index].msg_cntr, &devices[dest_index].nonce_cntr, &total_len, adata_len)) return ENCRYPT_FAILED;
+
 
 	/* Send packet over udp connection (Increment pointer by 1 to ignore length byte) */
 	uip_udp_packet_sendto(c, &tempbuf[1], (int)total_len, toaddr, toport);
@@ -298,9 +292,13 @@ keymanagement_send_encrypted_packet(struct uip_udp_conn *c, uint8_t *data, uint8
 	/* Update the current activity time */
 	devices[dest_index].time_last_activity = clock_seconds();
 
-	PRINTFDEBUG("msg and nonce A: %d, %d\n", devices[dest_index].msg_cntr, devices[dest_index].nonce_cntr);
-	PRINTFDEBUG("Cipher: "); for(i=1; i<total_len+1; i++) PRINTF("%c", tempbuf[i]); PRINTF("\n");
-	PRINTF("key: Encrypt OK\n");
+	PRINTFSECKEY("msg and nonce A: %d, %d\n", devices[dest_index].msg_cntr, devices[dest_index].nonce_cntr);
+
+	PRINTF("Cipher: "); for(i=1; i<total_len+1; i++) PRINTF("%c", tempbuf[i]); PRINTF("\n");
+
+	PRINTFDEBUG("after: ");
+	for(i=1; i<total_len+1; i++) PRINTFDEBUG("%.2x",tempbuf[i]);
+	PRINTFDEBUG("\n");
 
 	return ENCRYPT_OK;
 }
@@ -338,11 +336,11 @@ keymanagement_decrypt_packet(uip_ipaddr_t *remote_device_id, uint8_t *data, uint
 	for(i=0; i < MSG_NONCE_SIZE; i++) src_msg_cntr |= ((uint16_t)data[i] << (((MSG_NONCE_SIZE-1)-i)*8));
 	src_nonce_cntr = data[MSG_NONCE_SIZE];
 
-	PRINTFDEBUG("dec_nonce %d dec_msgcntr %d\n", src_nonce_cntr, src_msg_cntr);
+	PRINTFSECKEY("dec_nonce %d dec_msgcntr %d\n", src_nonce_cntr, src_msg_cntr);
 
 	if(((src_msg_cntr <= devices[src_index].remote_msg_cntr) && (src_nonce_cntr <= devices[src_index].remote_nonce_cntr)) ||
 					(src_nonce_cntr < devices[src_index].remote_nonce_cntr)) {
-		PRINTFDEBUG("Replay message storeM: %d, recM: %d\n", devices[src_index].remote_msg_cntr, src_msg_cntr);
+		PRINTFSECKEY("Replay message storeM: %d, recM: %d\n", devices[src_index].remote_msg_cntr, src_msg_cntr);
 		return REPLAY_MESSAGE;
 	}
 
@@ -354,8 +352,9 @@ keymanagement_decrypt_packet(uip_ipaddr_t *remote_device_id, uint8_t *data, uint
 
 	/* Decrypt message */
 	if(!(cc2420_decrypt_ccm(data, &devices[src_index].remote_device_id.u8[0], &src_msg_cntr, &src_nonce_cntr, data_len, adata_len))) return DECRYPT_FAILED;
-
-	PRINTFDEBUG("dec_data: "); for(i=0;i<*data_len;i++) PRINTFDEBUG("%02x ", data[i]); PRINTFDEBUG("\n");
+	PRINTFSECKEY("dec_data: ");
+	for(i=0;i<*data_len;i++) PRINTFSECKEY("%02x ", data[i]);
+	PRINTFSECKEY("\n");
 
 	/* Check if authentication was successful */
 	if(data[*data_len-1] != AUTHENTICATION_SUCCES) return AUTHENTICATION_FAILED;
@@ -367,7 +366,7 @@ keymanagement_decrypt_packet(uip_ipaddr_t *remote_device_id, uint8_t *data, uint
 	/* Update the current activity time */
 	devices[src_index].time_last_activity = clock_seconds();
 
-	PRINTF("key: Decrypt OK\n");
+	PRINTFDEBUG("Decrypt OK\n");
 	return DECRYPT_OK;
 }
 
@@ -383,7 +382,7 @@ PROCESS_THREAD(keymanagement_process, ev, data)
 
 	PROCESS_BEGIN();
 
-	PRINTF("key: keymanagement_process: started\n");
+	PRINTFSECKEY("keymanagement_process: started\n");
 
 	/*
 	 * new connection with remote host at port 0
@@ -392,8 +391,8 @@ PROCESS_THREAD(keymanagement_process, ev, data)
 	 */
 	sec_conn = udp_new(NULL, 0, NULL);
 	if(sec_conn == NULL) {
-		PRINTF("key: No UDP conn, exiting proc!\n");
-		PROCESS_EXIT();
+	  PRINTFSECKEY("No UDP conn, exiting proc!\n");
+	  PROCESS_EXIT();
 	}
 	udp_bind(sec_conn, UIP_HTONS(UDP_CLIENT_SEC_PORT));
 
@@ -495,7 +494,9 @@ static void
 set_session_key_of_index(int index)
 {
 	uint8_t i;
-	PRINTFDEBUG("key: "); for(i=0;i<16;i++) PRINTFDEBUG("%02x ", devices[index].session_key[i]); PRINTFDEBUG("\n");
+	PRINTFSECKEY("key: ");
+	for(i=0;i<16;i++) PRINTFSECKEY("%02x ", devices[index].session_key[i]);
+	PRINTFSECKEY("\n");
 	CC2420_WRITE_RAM_REV(&devices[index].session_key[0], CC2420RAM_KEY1, SEC_KEY_SIZE);
 }
 
@@ -518,20 +519,6 @@ find_index_for_request(keyfreshness_flags_type_t search_option)
 	if((search_option == UPDATE_NONCE) && (update_key_exchange_nonce == 1)) return MAX_DEVICES+1;
 	return MAX_DEVICES;
 }
-
-/*-----------------------------------------------------------------------------------*/
-/**
- * Update nonce writes the new nonce of devices[index] to flash memory
- *
- * @param index of device																NIET GETEST!
- */
-/*-----------------------------------------------------------------------------------*/
-static void
-update_nonce(uint8_t index)
-{
-	devices[index].key_freshness = FRESH;
-}
-
 /*-----------------------------------------------------------------------------------*/
 /**
  *	Removes a security device from stored devices
@@ -545,44 +532,6 @@ remove_sec_device(uint8_t index)
 	reset_sec_data(index);
 	amount_of_known_devices--;
 }
-
-/*-----------------------------------------------------------------------------------*/
-/**
- *	Reset security data from device at position "index"
- *
- *	@param current device_index															NIET AF!
- */
-/*-----------------------------------------------------------------------------------*/
-static void
-reset_sec_data(uint8_t index)
-{
-	devices[index].nonce_cntr = 1;
-	devices[index].msg_cntr = 0;
-	devices[index].remote_msg_cntr = 0;
-	devices[index].remote_nonce_cntr = 0;
-	devices[index].time_last_activity = 0;
-
-	if(index != RESERVED_INDEX) {
-		/* Set as free spot */
-		devices[index].key_freshness = FREE_SPOT;
-		/* Reset device id */
-		memset(&devices[index].remote_device_id.u8[0], 0, DEVICE_ID_SIZE);
-	}
-}
-
-/*-----------------------------------------------------------------------------------*/
-/**
- *	Copy the device id to the reserved spot for key-exchange
- *
- *	@param current device_index															NIET AF!
- */
-/*-----------------------------------------------------------------------------------*/
-static void
-copy_id_to_reserved(uint8_t index)
-{
-	memcpy(&devices[RESERVED_INDEX].remote_device_id.u8[0], &devices[index].remote_device_id.u8[0], DEVICE_ID_SIZE);
-}
-
 /*-----------------------------------------------------------------------------------*/
 /**
  *	Store the temporary security data in a free spot if not found						NIET AF!
@@ -602,26 +551,9 @@ store_reserved_sec_data(void)
 	devices[index] = devices[RESERVED_INDEX];
 	devices[index].key_freshness = FRESH;
 
-	/* Reset RESERVED id */
-	memset(&devices[RESERVED_INDEX].remote_device_id.u8[0], 0, DEVICE_ID_SIZE);
+	/* Reset RESERVED id */	
+	resetDeviceID_by_Index(RESERVED_INDEX);
 }
-
-/*-----------------------------------------------------------------------------------*/
-/**
- *	Reset the failed key-exchanges to expired											NIET AF!
- */
-/*-----------------------------------------------------------------------------------*/
-static void
-reset_failed_key_exchanges(void)
-{
-	uint8_t i;
-	for(i=2; i<MAX_DEVICES; i++) {
-		if(devices[i].key_freshness == FAILED) {
-			devices[i].key_freshness = EXPIRED;
-		}
-	}
-}
-
 /*-----------------------------------------------------------------------------------*/
 /**
  *	Remove the security device that has been inactive the longest time					NIET AF!
@@ -668,7 +600,7 @@ key_exchange_protocol(void)
 	/* Is there anything to send? */
 	if(key_exchange_state == S_KEY_EXCHANGE_SUCCES) {
 		/* Key exchange is finished */
-		PRINTF("key: Success\n");
+		PRINTFDEBUG("key: Succes\n");
 
 		/* Store security data */
 		store_reserved_sec_data();
@@ -676,7 +608,7 @@ key_exchange_protocol(void)
 		return 0;
 
 	} else if(key_exchange_state == S_KEY_EXCHANGE_FAILED) {
-		PRINTF("key: Failed\n");
+		PRINTFDEBUG("key: Failed\n");
 		/* Increment fails of requested device */
 		int device_index = search_device_id(&devices[RESERVED_INDEX].remote_device_id,2);
 		if(!(device_index < 0)) {
@@ -690,14 +622,19 @@ key_exchange_protocol(void)
 		/* Reset RESERVED device */
 		reset_sec_data(RESERVED_INDEX);
 
-		/* Reset device id */
-		memset(&devices[RESERVED_INDEX].remote_device_id.u8[0], 0, DEVICE_ID_SIZE);
+		/* Reset device id */		
+		resetDeviceID_by_Index(RESERVED_INDEX);
 		return 0;
 
 	}
 
 	/* Create and send protocol message */
 	send_key_exchange_packet();
+
+	uint8_t i;
+	PRINTFSECKEY("key buf: ");
+	for(i=0; i<tot_len; i++) PRINTFSECKEY("%.2x",keypacketbuf[i]);
+	PRINTFSECKEY("\n");
 
 	/* Increment send tries */
 	if(send_tries > MAX_WAIT_TIME_SEND) {
@@ -880,7 +817,6 @@ parse_packet(uint8_t *data, uint16_t len)
 	switch(key_exchange_state) {
 		case S_KEY_EXCHANGE_IDLE:
 			if(data[0] == S_INIT_REQUEST && len == INIT_REQUEST_MSG_SIZE) {
-				PRINTF("key: Got key-excahnge request\n");
 				/* Check if we know the source */
 				device_index = search_device_id(&UIP_IP_BUF->srcipaddr,0);
 				if(device_index < 0) {
@@ -904,7 +840,6 @@ parse_packet(uint8_t *data, uint16_t len)
 
 		case S_INIT_REQUEST:
 			if(data[0] == S_INIT_REPLY && len == INIT_REPLY_MSG_SIZE && send_tries > 0) {
-				PRINTF("key: Got request reply\n");
 				/* Check the remote device id */
 				if(memcmp(&UIP_IP_BUF->srcipaddr.u8[0], &devices[RESERVED_INDEX].remote_device_id.u8[0], DEVICE_ID_SIZE) == 0) {
 					/* Get the remote nonce */
@@ -920,7 +855,6 @@ parse_packet(uint8_t *data, uint16_t len)
 		case S_INIT_REPLY:	   /* | request_nonce(3) | */
 			if(data[3] == S_COMM_REPLY && len == COMM_REPLY_MSG_SIZE) {
 				if(keymanagement_decrypt_packet(&UIP_IP_BUF->srcipaddr, data, &temp_data_len, ADATA_KEYEXCHANGE) == DECRYPT_OK) {
-					PRINTF("key: Got reply from server\n");
 					/* Parse packet */
 					if(parse_comm_reply_message(data)) {
 						/* Send verify message */
@@ -935,7 +869,6 @@ parse_packet(uint8_t *data, uint16_t len)
 		case S_COMM_REQUEST:   /* | remote_decryption_nonce(3) | msg_type(1) | request_nonce(3) | sessionkey(16) | id remote(16) | MIC(8) | */
 			if(data[3] == S_COMM_REPLY && len == COMM_REPLY_MSG_SIZE) {
 				if(keymanagement_decrypt_packet(&UIP_IP_BUF->srcipaddr, data, &temp_data_len, ADATA_KEYEXCHANGE) == DECRYPT_OK) {
-					PRINTF("key: Got reply from server\n");
 					/* Parse packet */
 					if(parse_comm_reply_message(data)) {
 						/* Wait for Verify message */
@@ -950,7 +883,6 @@ parse_packet(uint8_t *data, uint16_t len)
 		case S_COMM_REPLY:
 			if(data[3] == S_VERIFY_REQUEST && len == VERIFY_REQUEST_MSG_SIZE && send_tries > 0) {
 				if(keymanagement_decrypt_packet(&UIP_IP_BUF->srcipaddr, data, &temp_data_len, ADATA_KEYEXCHANGE) == DECRYPT_OK) {
-					PRINTF("key: Got verification request\n");
 					/* Store verify nonce */
 					memcpy(&remote_verify_nonce[0], &data[4], 3);
 					/* reply to verify message */
@@ -965,7 +897,7 @@ parse_packet(uint8_t *data, uint16_t len)
 			if(data[3] == S_VERIFY_REPLY && len == VERIFY_REPLY_MSG_SIZE) {
 				if(keymanagement_decrypt_packet(&UIP_IP_BUF->srcipaddr, data, &temp_data_len, ADATA_KEYEXCHANGE) == DECRYPT_OK) {
 					/* Decrement verify request nonce */
-					PRINTF("key: Got reply verification\n");
+					PRINTFDEBUG("Got reply\n");
 					get_decrement_verify_nonce(temp_verify_nonce);
 					PRINTFDEBUG("temp: %02x %02x %02x\n", temp_verify_nonce[0], temp_verify_nonce[1], temp_verify_nonce[2]);
 					PRINTFDEBUG("rece: %02x %02x %02x\n", data[4], data[5], data[6]);
@@ -1014,17 +946,22 @@ parse_comm_reply_message(uint8_t *data) {
 	set16(temp_request_nonce, 0, request_nonce);
 	temp_request_nonce[2] = request_nonce_cntr;
 
+	uint8_t i;
+	PRINTFSECKEY("comm_nonce: ");
+	for(i=0; i<3; i++) PRINTFSECKEY("%02x ", temp_request_nonce[i]);
+	PRINTFSECKEY("\n");
+
 	/* Check request nonce */
 	if(memcmp(&data[REQUEST_NONCE_OFFSET], &temp_request_nonce[0], 3) != 0) {
 		/* Doesn't belong with current request - replay message */
-		PRINTF("key: wrong req_nonce\n");
+		PRINTFSECKEY("wrong req_nonce\n");
 		return 0;
 	}
 
 	/* Check device id */
 	if(memcmp(&data[ID_OFFSET], &curr_ip.u8[0], DEVICE_ID_SIZE) != 0) {
 		/* Wrong id */
-		PRINTF("key: wrong id\n");
+		PRINTFSECKEY("wrong id\n");
 		return 0;
 	}
 
@@ -1035,7 +972,7 @@ parse_comm_reply_message(uint8_t *data) {
 	/* Increment request nonce */
 	increment_request_nonce();
 
-	PRINTF("key: Parse ok\n");
+	PRINTFSECKEY("Parse ok\n");
 
 	return 1;
 }
